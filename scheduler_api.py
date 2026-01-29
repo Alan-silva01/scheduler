@@ -31,12 +31,18 @@ def verify_token(authorization: str = Header(None)):
     
     return token
 
-redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'localhost'),
-    port=int(os.getenv('REDIS_PORT', 6379)),
-    password=os.getenv('REDIS_PASSWORD'),
-    decode_responses=True
-)
+# Tenta usar REDIS_URL primeiro (padrão em clouds como Render/Heroku/Railway)
+redis_url = os.getenv('REDIS_URL')
+
+if redis_url:
+    redis_client = redis.from_url(redis_url, decode_responses=True)
+else:
+    redis_client = redis.Redis(
+        host=os.getenv('REDIS_HOST', 'localhost'),
+        port=int(os.getenv('REDIS_PORT', 6379)),
+        password=os.getenv('REDIS_PASSWORD'),
+        decode_responses=True
+    )
 
 # Usar APScheduler ao invés de schedule
 scheduler = BackgroundScheduler(timezone=pytz.UTC)
