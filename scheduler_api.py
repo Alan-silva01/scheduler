@@ -50,9 +50,51 @@ scheduler.start()
 
 class ScheduleMessage(BaseModel):
     id: str
-    scheduleTo: str
+    scheduleTo: str  # Aceita: "29-01-2026 21:08" ou "2026-01-29T21:08:00" ou ISO com timezone
     payload: Dict[str, Any]
     webhookUrl: str
+    timezone: str = "America/Sao_Paulo"  # Timezone padrão: Brasil
+
+def parse_schedule_time(schedule_to: str, timezone_str: str) -> datetime:
+    """
+    Converte o horário de entrada para UTC.
+    Aceita formatos:
+    - "29-01-2026 21:08" (DD-MM-YYYY HH:MM) - horário local
+    - "29-01-2026 21:08:30" (DD-MM-YYYY HH:MM:SS) - horário local
+    - "2026-01-29T21:08:00" (ISO sem timezone) - tratado como horário local
+    - "2026-01-29T21:08:00Z" (ISO UTC)
+    - "2026-01-29T21:08:00-03:00" (ISO com offset)
+    """
+    user_tz = pytz.timezone(timezone_str)
+    
+    # Tenta formato brasileiro simples: DD-MM-YYYY HH:MM ou DD-MM-YYYY HH:MM:SS
+    for fmt in ["%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"]:
+        try:
+            local_time = datetime.strptime(schedule_to, fmt)
+            # Localiza para o timezone do usuário e converte para UTC
+            localized_time = user_tz.localize(local_time)
+            return localized_time.astimezone(pytz.UTC)
+        except ValueError:
+            continue
+    
+    # Tenta formato ISO
+    try:
+        # Se tem Z ou offset, é timezone-aware
+        if 'Z' in schedule_to or '+' in schedule_to or (schedule_to.count('-') > 2):
+            parsed = datetime.fromisoformat(schedule_to.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                # ISO sem timezone - trata como horário local
+                parsed = user_tz.localize(parsed)
+            return parsed.astimezone(pytz.UTC)
+        else:
+            # ISO sem timezone - trata como horário local
+            parsed = datetime.fromisoformat(schedule_to)
+            localized_time = user_tz.localize(parsed)
+            return localized_time.astimezone(pytz.UTC)
+    except ValueError:
+        pass
+    
+    raise ValueError(f"Formato de data não reconhecido: {schedule_to}. Use 'DD-MM-YYYY HH:MM' ou formato ISO.")
 
 def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
     try:
@@ -65,9 +107,9 @@ def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
         redis_client.delete(f"message:{message_id}")
         print(f"[{datetime.now().isoformat()}] Message {message_id} cleaned from Redis")
 
-def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any]):
-    # Parse da data ISO com timezone
-    schedule_time = datetime.fromisoformat(schedule_timestamp.replace('Z', '+00:00'))
+def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any], timezone_str: str = "America/Sao_Paulo"):
+    # Parse da data usando o novo parser com suporte a timezone local
+    schedule_time = parse_schedule_time(schedule_timestamp, timezone_str)
     current_time = datetime.now(pytz.UTC)
     
     # Se a data já passou, executa imediatamente
@@ -102,8 +144,9 @@ def restore_scheduled_messages():
                 schedule_to = message_data["scheduleTo"]
                 webhook_url = message_data["webhookUrl"]
                 payload = message_data["payload"]
+                timezone_str = message_data.get("timezone", "America/Sao_Paulo")
                 
-                schedule_message(message_id, schedule_to, webhook_url, payload)
+                schedule_message(message_id, schedule_to, webhook_url, payload, timezone_str)
                 restored_count += 1
                 print(f"[{datetime.now().isoformat()}] Restored scheduled message - ID: {message_id}")
                 
@@ -130,15 +173,24 @@ async def create_scheduled_message(message: ScheduleMessage, token: str = Depend
             "id": message.id,
             "scheduleTo": message.scheduleTo,
             "payload": message.payload,
-            "webhookUrl": message.webhookUrl
+            "webhookUrl": message.webhookUrl,
+            "timezone": message.timezone
         }
         
         redis_client.set(redis_key, json.dumps(message_data))
         print(f"[{datetime.now().isoformat()}] Message inserted to Redis - ID: {message.id}")
         
-        schedule_message(message.id, message.scheduleTo, message.webhookUrl, message.payload)
+        # Parse e agenda a mensagem
+        schedule_time_utc = parse_schedule_time(message.scheduleTo, message.timezone)
+        schedule_message(message.id, message.scheduleTo, message.webhookUrl, message.payload, message.timezone)
         
-        return {"status": "scheduled", "messageId": message.id}
+        return {
+            "status": "scheduled", 
+            "messageId": message.id,
+            "scheduledFor": schedule_time_utc.isoformat(),
+            "inputTime": message.scheduleTo,
+            "timezone": message.timezone
+        }
     
     except HTTPException as http_exc:
         print(f"[{datetime.now().isoformat()}] HTTPException in create: {http_exc.status_code} - {http_exc.detail}")
