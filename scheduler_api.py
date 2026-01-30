@@ -55,46 +55,83 @@ class ScheduleMessage(BaseModel):
     webhookUrl: str
     timezone: str = "America/Sao_Paulo"  # Timezone padrão: Brasil
 
-def parse_schedule_time(schedule_to: str, timezone_str: str) -> datetime:
+def parse_schedule_time(schedule_to: str, timezone_str: str) -> tuple[datetime, str]:
     """
-    Converte o horário de entrada para UTC.
+    Converte o horário de entrada para UTC usando linguagem natural.
+    
     Aceita formatos:
-    - "29-01-2026 21:08" (DD-MM-YYYY HH:MM) - horário local
-    - "29-01-2026 21:08:30" (DD-MM-YYYY HH:MM:SS) - horário local
-    - "2026-01-29T21:08:00" (ISO sem timezone) - tratado como horário local
-    - "2026-01-29T21:08:00Z" (ISO UTC)
-    - "2026-01-29T21:08:00-03:00" (ISO com offset)
+    - "amanhã às 14:00"
+    - "hoje às 18h"
+    - "segunda-feira às 9:00"
+    - "daqui 2 horas"
+    - "próximo sábado às 10:00"
+    - "em 30 minutos"
+    - "29-01-2026 21:08"
+    - "29/01/2026 14:00"
+    - "2026-01-29T21:08:00"
+    - E muito mais...
+    
+    Retorna: (datetime em UTC, string formatada do horário local interpretado)
     """
+    import dateparser
+    
     user_tz = pytz.timezone(timezone_str)
+    current_time = datetime.now(user_tz)
     
-    # Tenta formato brasileiro simples: DD-MM-YYYY HH:MM ou DD-MM-YYYY HH:MM:SS
-    for fmt in ["%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"]:
-        try:
-            local_time = datetime.strptime(schedule_to, fmt)
-            # Localiza para o timezone do usuário e converte para UTC
-            localized_time = user_tz.localize(local_time)
-            return localized_time.astimezone(pytz.UTC)
-        except ValueError:
-            continue
+    # Configurações do dateparser para português brasileiro
+    parser_settings = {
+        'TIMEZONE': timezone_str,
+        'RETURN_AS_TIMEZONE_AWARE': True,
+        'PREFER_DATES_FROM': 'future',  # Prefere datas futuras
+        'PREFER_DAY_OF_MONTH': 'first',
+        'DATE_ORDER': 'DMY',  # Formato brasileiro: dia/mês/ano
+        'PARSERS': ['relative-time', 'custom-formats', 'absolute-time', 'timestamp', 'no-spaces-time'],
+    }
     
-    # Tenta formato ISO
-    try:
-        # Se tem Z ou offset, é timezone-aware
-        if 'Z' in schedule_to or '+' in schedule_to or (schedule_to.count('-') > 2):
-            parsed = datetime.fromisoformat(schedule_to.replace('Z', '+00:00'))
-            if parsed.tzinfo is None:
-                # ISO sem timezone - trata como horário local
-                parsed = user_tz.localize(parsed)
-            return parsed.astimezone(pytz.UTC)
-        else:
-            # ISO sem timezone - trata como horário local
-            parsed = datetime.fromisoformat(schedule_to)
-            localized_time = user_tz.localize(parsed)
-            return localized_time.astimezone(pytz.UTC)
-    except ValueError:
-        pass
+    # Tenta parsear com dateparser (suporta português)
+    parsed = dateparser.parse(
+        schedule_to,
+        languages=['pt', 'en'],
+        settings=parser_settings
+    )
     
-    raise ValueError(f"Formato de data não reconhecido: {schedule_to}. Use 'DD-MM-YYYY HH:MM' ou formato ISO.")
+    if parsed is None:
+        # Fallback: tenta formatos brasileiros manualmente
+        for fmt in ["%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"]:
+            try:
+                local_time = datetime.strptime(schedule_to, fmt)
+                parsed = user_tz.localize(local_time)
+                break
+            except ValueError:
+                continue
+    
+    if parsed is None:
+        raise ValueError(
+            f"Não foi possível interpretar a data/hora: '{schedule_to}'. "
+            f"Exemplos válidos: 'amanhã às 14:00', 'segunda-feira às 18h', "
+            f"'daqui 2 horas', '30-01-2026 15:00'"
+        )
+    
+    # Garante que está timezone-aware
+    if parsed.tzinfo is None:
+        parsed = user_tz.localize(parsed)
+    
+    # Converte para o timezone do usuário para exibição
+    local_parsed = parsed.astimezone(user_tz)
+    parsed_str = local_parsed.strftime("%d-%m-%Y %H:%M")
+    
+    # Converte para UTC para agendamento
+    utc_time = parsed.astimezone(pytz.UTC)
+    
+    # Valida se a data não está no passado
+    if utc_time <= datetime.now(pytz.UTC):
+        raise ValueError(
+            f"Data/hora já passou! "
+            f"Horário atual: {current_time.strftime('%d-%m-%Y %H:%M')}. "
+            f"Solicitado: {parsed_str}"
+        )
+    
+    return utc_time, parsed_str
 
 def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
     try:
@@ -107,16 +144,10 @@ def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
         redis_client.delete(f"message:{message_id}")
         print(f"[{datetime.now().isoformat()}] Message {message_id} cleaned from Redis")
 
-def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any], timezone_str: str = "America/Sao_Paulo"):
-    # Parse da data usando o novo parser com suporte a timezone local
-    schedule_time = parse_schedule_time(schedule_timestamp, timezone_str)
-    current_time = datetime.now(pytz.UTC)
-    
-    # Se a data já passou, executa imediatamente
-    if schedule_time <= current_time:
-        print(f"[{datetime.now().isoformat()}] Schedule time in the past, firing immediately - ID: {message_id}")
-        fire_webhook(message_id, webhook_url, payload)
-        return
+def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any], timezone_str: str = "America/Sao_Paulo") -> tuple[datetime, str]:
+    # Parse da data usando o novo parser com suporte a linguagem natural
+    # parse_schedule_time já valida se a data está no futuro
+    schedule_time, parsed_str = parse_schedule_time(schedule_timestamp, timezone_str)
     
     # Agenda para a data específica usando APScheduler
     try:
@@ -131,6 +162,8 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
     except Exception as e:
         print(f"[{datetime.now().isoformat()}] Failed to schedule job - ID: {message_id}, Error: {e}")
         raise
+    
+    return schedule_time, parsed_str
 
 def restore_scheduled_messages():
     try:
@@ -180,14 +213,16 @@ async def create_scheduled_message(message: ScheduleMessage, token: str = Depend
         redis_client.set(redis_key, json.dumps(message_data))
         print(f"[{datetime.now().isoformat()}] Message inserted to Redis - ID: {message.id}")
         
-        # Parse e agenda a mensagem
-        schedule_time_utc = parse_schedule_time(message.scheduleTo, message.timezone)
-        schedule_message(message.id, message.scheduleTo, message.webhookUrl, message.payload, message.timezone)
+        # Parse e agenda a mensagem (schedule_message já faz a validação)
+        schedule_time_utc, parsed_str = schedule_message(
+            message.id, message.scheduleTo, message.webhookUrl, message.payload, message.timezone
+        )
         
         return {
             "status": "scheduled", 
             "messageId": message.id,
             "scheduledFor": schedule_time_utc.isoformat(),
+            "parsedTime": parsed_str,
             "inputTime": message.scheduleTo,
             "timezone": message.timezone
         }
