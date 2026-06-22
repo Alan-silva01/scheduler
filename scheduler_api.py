@@ -88,12 +88,22 @@ def parse_schedule_time(schedule_to: str, timezone_str: str) -> tuple[datetime, 
         'PARSERS': ['relative-time', 'custom-formats', 'absolute-time', 'timestamp', 'no-spaces-time'],
     }
     
-    # Tenta parsear com dateparser (suporta português)
-    parsed = dateparser.parse(
-        schedule_to,
-        languages=['pt', 'en'],
-        settings=parser_settings
-    )
+    parsed = None
+    
+    # Tenta parsear como formato ISO 8601 direto primeiro (ex: "2026-06-23T15:00:00.000Z")
+    try:
+        clean_iso = schedule_to.replace('Z', '+00:00')
+        parsed = datetime.fromisoformat(clean_iso)
+    except ValueError:
+        pass
+    
+    if parsed is None:
+        # Tenta parsear com dateparser (suporta português)
+        parsed = dateparser.parse(
+            schedule_to,
+            languages=['pt', 'en'],
+            settings=parser_settings
+        )
     
     if parsed is None:
         # Fallback: tenta formatos brasileiros manualmente
